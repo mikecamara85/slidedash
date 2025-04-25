@@ -4,4 +4,6 @@ Slidedash is a utility to produce a video slideshow from an array of image files
 
 - This has only been tested in Windows, so the below instruction is for Windows.
 
-- You also need to download and unzip FFMPEG on your system and add the full file path to FFMPEG's "bin" folder to PATH on your computer
+- You also need to download and unzip FFMPEG on your system and add the full file path to FFMPEG's "bin" folder to PATH on your computer.
+- I used the gyan.dev build for Windows as shown here: https://ffmpeg.org/download.html#build-windows
+- To unzip this build, you need to also have 7zip on your system
