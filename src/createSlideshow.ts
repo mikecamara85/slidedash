@@ -1,9 +1,29 @@
+import "dotenv/config";
 import ffmpeg from "fluent-ffmpeg";
+import sharp from "sharp";
 import * as fs from "fs";
 import * as path from "path";
-import sharp from "sharp";
+import { OpenAI } from "openai";
 
-// Utility to get audio duration (in seconds)
+// === OpenAI TTS Setup ===
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+// Generate speech mp3 from text using OpenAI TTS
+async function generateTTS(
+  text: string,
+  outputPath: string,
+  voice: "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer" = "alloy"
+) {
+  const mp3Stream = await openai.audio.speech.create({
+    model: "tts-1",
+    voice: voice,
+    input: text,
+  });
+  const buffer = Buffer.from(await mp3Stream.arrayBuffer());
+  fs.writeFileSync(outputPath, buffer);
+}
+
+// Utility to get audio duration
 function getAudioDuration(audioPath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(audioPath, (err, metadata) => {
@@ -13,7 +33,7 @@ function getAudioDuration(audioPath: string): Promise<number> {
   });
 }
 
-// Resize images same as before...
+// Resize images
 async function resizeImages(
   inputPaths: string[],
   outputDir: string,
@@ -27,10 +47,7 @@ async function resizeImages(
       `slide${idx.toString().padStart(3, "0")}.jpg`
     );
     await sharp(src)
-      .resize(width, height, {
-        fit: "contain",
-        background: "#000",
-      })
+      .resize(width, height, { fit: "contain", background: "#000" })
       .toFormat("jpeg")
       .toFile(dest);
     return dest;
@@ -46,39 +63,42 @@ function createConcatList(
   const lines = [];
   for (let i = 0; i < images.length; i++) {
     lines.push(`file '${images[i].replace(/'/g, "'\\''")}'`);
-    // Duration only for all except last image
     if (i < images.length - 1) lines.push(`duration ${duration}`);
   }
-  // Repeat last image without duration
   lines.push(`file '${images[images.length - 1].replace(/'/g, "'\\''")}'`);
   fs.writeFileSync(listPath, lines.join("\n"), "utf-8");
 }
 
-export async function createSlideshowWithAudio(
+// The main function: images, narration text, output file
+export async function createSlideshowWithTTS(
   images: string[],
-  audioPath: string,
+  narrationText: string,
   output: string,
   width = 800,
-  height = 600
+  height = 600,
+  voice: "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer" = "alloy"
 ): Promise<void> {
   const tmpDir = path.join(__dirname, "tmp_slides");
+  const audioDir = path.join(__dirname, "audio");
+  if (!fs.existsSync(audioDir)) fs.mkdirSync(audioDir);
+  const ttsAudioPath = path.join(audioDir, "tts.mp3");
   const listFile = path.join(tmpDir, "input.txt");
   try {
-    // 1. Get audio duration
-    const audioDuration = await getAudioDuration(audioPath);
+    // 1. Generate TTS audio
+    await generateTTS(narrationText, ttsAudioPath, "shimmer");
+
+    // 2. Get audio duration and prepare images
+    const audioDuration = await getAudioDuration(ttsAudioPath);
     const durationPerSlide = audioDuration / images.length;
     const resizedImages = await resizeImages(images, tmpDir, width, height);
     createConcatList(resizedImages, durationPerSlide, listFile);
 
-    // 4. Create FFmpeg concat list file
-    createConcatList(resizedImages, durationPerSlide, listFile);
-
-    // 5. Combine video and audio, trim to audio duration
+    // 3. Build video
     await new Promise<void>((resolve, reject) => {
       ffmpeg()
         .input(listFile)
         .inputOptions(["-f", "concat", "-safe", "0"])
-        .input(audioPath)
+        .input(ttsAudioPath)
         .outputOptions([
           "-r",
           "25",
@@ -101,16 +121,21 @@ export async function createSlideshowWithAudio(
       );
       fs.rmdirSync(tmpDir);
     }
+    // Optionally: remove ttsAudioPath
+    // fs.existsSync(ttsAudioPath) && fs.unlinkSync(ttsAudioPath);
   }
 }
 
-// Usage Example:
+// === USAGE ===
 const imagesDirectory = path.join(__dirname, "images");
 const images = fs
   .readdirSync(imagesDirectory)
+  .filter((f) => /\.(jpg|jpeg|png)$/i.test(f))
   .map((f) => path.join(imagesDirectory, f));
-const audioPath = path.join(__dirname, "audio", "red-camry-xse.mp3");
 
-createSlideshowWithAudio(images, audioPath, "red-camry-xse.mp4")
-  .then(() => console.log("Slideshow with audio created successfully!"))
+const narrationText =
+  "Get ready for adventure with Auto Gals' 2021 Jeep Gladiator Sport S! This eye-catching grey 4x4 comes with a powerful 3.6-liter 6-cylinder engine, automatic transmission, and only 34,153 miles. Built for safety, it features active belts, airbags, and anti-lock brakes, while comfort and convenience come standard with air conditioning, premium audio, a tilt steering wheel, keyless entry, and an immobilizer. Whether you're heading off-road or driving through town, the spacious Sport S trim is ready for anything. Visit us at Auto Gals in Fall River or Swansea to test drive the Jeep Gladiator today!";
+
+createSlideshowWithTTS(images, narrationText, "video-file.mp4")
+  .then(() => console.log("Slideshow with AI-generated narration created!"))
   .catch((e) => console.error("Error:", e));
