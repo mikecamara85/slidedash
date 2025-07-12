@@ -109,8 +109,8 @@ const imagesDirectory = path.join(__dirname, "images");
 const images = fs
   .readdirSync(imagesDirectory)
   .map((f) => path.join(imagesDirectory, f));
-const audioPath = path.join(__dirname, "audio", "amg-audio.mp3");
+const audioPath = path.join(__dirname, "audio", "red-camry-xse.mp3");
 
-createSlideshowWithAudio(images, audioPath, "amg-video.mp4")
+createSlideshowWithAudio(images, audioPath, "red-camry-xse.mp4")
   .then(() => console.log("Slideshow with audio created successfully!"))
   .catch((e) => console.error("Error:", e));
