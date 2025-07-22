@@ -240,9 +240,8 @@ if (require.main === module) {
     .map((f) => path.join(imagesDirectory, f));
 
   const narrationText =
-    "Discover the elegance and performance of our 2015 Acura TLX Advance at Auto Gals! This stunning burgundy sedan features a powerful 3.5-liter V6 engine and super-handling all-wheel-drive for a truly exhilarating adventure. With just 80,689 miles, it comes loaded with luxury and advanced safety features, including Blind Spot and Lane Departure Warnings, a power sunroof, and keyless ignition. The stylish exterior turns heads, while the comfortable interior promises every journey is a pleasure. Visit us at Auto Gals in Fall River today and experience this exceptional Acura TLX for yourself!";
+    "Experience the ultimate in luxury and command the road with our 2021 Jeep Grand Cherokee Limited at Auto Gals Inc. This striking SUV, dressed in a captivating burgundy hue, offers the perfect blend of style and performance. With only 29,194 miles on the odometer, it’s practically new, ready for city cruising or countryside adventures. Enjoy the power of a robust 3.6-liter 6-cylinder engine and the smoothness of an 8-speed automatic transmission for an exhilarating drive every time.  This 4x4 Jeep is loaded with spacious comfort and advanced features, so every drive is a premium experience. Stay confident and secure with safety technologies like a backup camera, blind-spot warning, and lane-keeping assistance. The Grand Cherokee Limited’s luxurious interior ensures you’ll never want to leave the driver’s seat. Don’t miss your chance to own this top-of-the-line Jeep - your adventure starts at Auto Gals in Fall River today!";
 
-  // If you want background music, place 'background.mp3' in your project root (or update path)
   const backgroundMusicPath = path.join(__dirname, "audio", "background.mp3");
   // To disable music, use: undefined or ""
 
