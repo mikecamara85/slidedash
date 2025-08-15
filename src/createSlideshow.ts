@@ -11,19 +11,60 @@ type VoiceType = "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer";
 // ========== OpenAI TTS Setup ==========
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
+// Choose newer TTS by default; override with TTS_MODEL env if needed.
+const DEFAULT_TTS_MODEL =
+  (process.env.TTS_MODEL as string) || "gpt-4o-mini-tts";
+
 // Generate speech mp3 from text using OpenAI TTS
 async function generateTTS(
   text: string,
   outputPath: string,
-  voice: VoiceType = "shimmer"
+  voice: VoiceType = "shimmer",
+  model: string = DEFAULT_TTS_MODEL
 ): Promise<void> {
   const mp3Stream = await openai.audio.speech.create({
-    model: "tts-1",
-    voice: voice,
+    model,
+    voice,
     input: text,
   });
   const buffer = Buffer.from(await mp3Stream.arrayBuffer());
   fs.writeFileSync(outputPath, buffer);
+}
+
+// Pitch-preserving retime via ffmpeg's atempo (0.5–2.0 per stage)
+async function retimeAudio(
+  inputPath: string,
+  outputPath: string,
+  speed: number = 1
+): Promise<void> {
+  if (!isFinite(speed) || speed <= 0) {
+    throw new Error("speechRate must be a positive number");
+  }
+  if (Math.abs(speed - 1) < 1e-3) {
+    if (inputPath !== outputPath) fs.copyFileSync(inputPath, outputPath);
+    return;
+  }
+
+  const filters: string[] = [];
+  let s = speed;
+  while (s < 0.5) {
+    filters.push("atempo=0.5");
+    s /= 0.5;
+  }
+  while (s > 2.0) {
+    filters.push("atempo=2.0");
+    s /= 2.0;
+  }
+  filters.push(`atempo=${s.toFixed(3)}`);
+
+  await new Promise<void>((resolve, reject) => {
+    ffmpeg(inputPath)
+      .audioFilters(filters)
+      .outputOptions(["-ar", "24000", "-ac", "1", "-b:a", "128k", "-y"])
+      .save(outputPath)
+      .on("end", () => resolve())
+      .on("error", reject);
+  });
 }
 
 // Add this helper to prepend your provided silence mp3 to the TTS file
@@ -36,7 +77,6 @@ async function prependSilence(
     "500-milliseconds-of-silence.mp3"
   )
 ): Promise<void> {
-  // 1. Make a temporary concat list file
   const concatFile = path.join(path.dirname(outputAudioPath), "concat.txt");
   fs.writeFileSync(
     concatFile,
@@ -46,7 +86,6 @@ async function prependSilence(
     )}'\nfile '${inputAudioPath.replace(/'/g, "'\\''")}'\n`
   );
 
-  // 2. Use ffmpeg to concatenate the files
   await new Promise<void>((resolve, reject) => {
     ffmpeg()
       .input(concatFile)
@@ -134,13 +173,10 @@ async function mixNarrationWithBackground(
         `[1]volume=${musicVolume}[bg]`,
         `[0][bg]amix=inputs=2:duration=first:dropout_transition=3`,
       ])
-      .outputOptions([
-        "-t",
-        ttsLength.toString(), // Trim to narration duration
-      ])
+      .outputOptions(["-t", ttsLength.toString()])
       .output(outputPath)
       .on("start", (cmd: string) => console.log("Mixing bgm:", cmd))
-      .on("end", (_stdout: string | null, _stderr: string | null) => resolve())
+      .on("end", () => resolve())
       .on("error", reject)
       .run();
   });
@@ -155,23 +191,28 @@ export async function createSlideshowWithTTS(
   height: number = 600,
   voice: VoiceType = "shimmer",
   backgroundMusicPath?: string,
-  musicVolume: number = 0.15
+  musicVolume: number = 0.15,
+  speechRate: number = 1 // e.g., 0.9 for slower, 1.1 for faster
 ): Promise<void> {
   const tmpDir = path.join(__dirname, "tmp_slides");
   const audioDir = path.join(__dirname, "audio");
   if (!fs.existsSync(audioDir)) fs.mkdirSync(audioDir);
 
   const ttsAudioPath = path.join(audioDir, "tts.mp3");
+  const ttsSlowedAudioPath = path.join(audioDir, "tts_slowed.mp3");
   const ttsPaddedAudioPath = path.join(audioDir, "tts_padded.mp3");
   const mixedAudioPath = path.join(audioDir, "tts_mixed.mp3");
   const listFile = path.join(tmpDir, "input.txt");
 
   try {
-    // 1. Generate TTS audio
+    // 1. Generate TTS audio (newer model by default, still accepts your chosen voice)
     await generateTTS(narrationText, ttsAudioPath, voice);
 
-    // 2. Prepend your silence MP3 to TTS audio
-    await prependSilence(ttsAudioPath, ttsPaddedAudioPath);
+    // 1b. Adjust speaking rate (pitch-preserving). If speechRate === 1, it's just a copy.
+    await retimeAudio(ttsAudioPath, ttsSlowedAudioPath, speechRate);
+
+    // 2. Prepend your silence MP3 to the (potentially retimed) TTS audio
+    await prependSilence(ttsSlowedAudioPath, ttsPaddedAudioPath);
 
     // 3. Get duration (based on padded TTS only)
     const audioDuration = await getAudioDuration(ttsPaddedAudioPath);
@@ -211,9 +252,7 @@ export async function createSlideshowWithTTS(
         ])
         .output(output)
         .on("start", (cmd: string) => console.log("Assembling video:", cmd))
-        .on("end", (_stdout: string | null, _stderr: string | null) =>
-          resolve()
-        )
+        .on("end", () => resolve())
         .on("error", reject)
         .run();
     });
@@ -226,7 +265,7 @@ export async function createSlideshowWithTTS(
       fs.rmdirSync(tmpDir);
     }
     // Optionally clean up audio files
-    // [ttsAudioPath, ttsPaddedAudioPath, mixedAudioPath].forEach(p => { if(fs.existsSync(p)) fs.unlinkSync(p) });
+    // [ttsAudioPath, ttsSlowedAudioPath, ttsPaddedAudioPath, mixedAudioPath].forEach(p => { if(fs.existsSync(p)) fs.unlinkSync(p) });
   }
 }
 
@@ -236,11 +275,11 @@ if (require.main === module) {
   const images = fs
     .readdirSync(imagesDirectory)
     .filter((f) => /\.(jpg|jpeg|png)$/i.test(f))
-    .sort() // optional: slides are sorted alphabetically
+    .sort()
     .map((f) => path.join(imagesDirectory, f));
 
   const narrationText =
-    "Introducing the 2012 Nissan 370Z at Auto Gals Incorporated, a stunning coupe with a deep amethyst finish that truly stands out. With only fifty-nine thousand well-maintained miles, this sporty vehicle features a powerful three point seven liter six-cylinder engine paired with an automatic transmission and rear-wheel drive for an exciting, reliable ride. Keyless entry, air conditioning, and power amenities ensure comfort and convenience, while advanced safety features like active belts and anti-lock brakes provide peace of mind. The luxurious interior matches its eye-catching exterior, making it the perfect blend of style and performance. Visit us in Fall River or Swansea to experience this exceptional three seventy Z for yourself.";
+    "Meet dependable style with Auto Gals Inc.'s 2014 Toyota RAV4 XLE, finished in timeless gray and showing just 60,646 miles. Its responsive 2.5-liter 4-cylinder teams with a smooth 6-speed automatic for confident, efficient driving. Slip inside to enjoy keyless entry, power windows and locks, and a high fidelity audio system. Thoughtful packaging delivers easy maneuverability, generous cargo room, and the everyday versatility compact SUV drivers love. Safety comes standard with active belts, anti-lock brakes, and Toyota's reputation for durability. Ready to go, this RAV4 XLE blends practicality and peace of mind. See it today in Fall River or Swansea!";
 
   const backgroundMusicPath = path.join(__dirname, "audio", "background.mp3");
   // To disable music, use: undefined or ""
@@ -251,9 +290,10 @@ if (require.main === module) {
     "video-file.mp4",
     1600,
     1200,
-    "shimmer", // TTS voice
+    "shimmer", // Try "fable" or "alloy" for a different prosody
     fs.existsSync(backgroundMusicPath) ? backgroundMusicPath : undefined,
-    0.2 // music volume (0.0 - 1.0)
+    0.2, // music volume (0.0 - 1.0)
+    0.9 // speechRate: 0.85–0.95 often feels more natural
   )
     .then(() => console.log("Slideshow with AI-generated narration created!"))
     .catch((e) => console.error("Error:", e));
