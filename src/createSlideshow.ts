@@ -1,50 +1,57 @@
 import "dotenv/config";
 import ffmpeg from "fluent-ffmpeg";
+import ffmpegStatic from "ffmpeg-static";
+import ffprobe from "@ffprobe-installer/ffprobe";
 import sharp from "sharp";
 import * as fs from "fs";
 import * as path from "path";
+import os from "os";
+import { pipeline } from "stream/promises";
 import { OpenAI } from "openai";
+import { randomUUID } from "crypto";
 
-// Type for voices
+// Force fluent-ffmpeg to use static binaries (portable)
+ffmpeg.setFfmpegPath(ffmpegStatic as string);
+ffmpeg.setFfprobePath(ffprobe.path);
+
 type VoiceType = "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer";
 
-// ========== OpenAI TTS Setup ==========
+// ========== OpenAI TTS ==========
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-
-// Choose newer TTS by default; override with TTS_MODEL env if needed.
 const DEFAULT_TTS_MODEL =
   (process.env.TTS_MODEL as string) || "gpt-4o-mini-tts";
 
-// Generate speech mp3 from text using OpenAI TTS
+// Generate speech audio. Prefer wav to avoid mp3 re-encode artifacts.
 async function generateTTS(
   text: string,
   outputPath: string,
   voice: VoiceType = "shimmer",
-  model: string = DEFAULT_TTS_MODEL
+  model: string = DEFAULT_TTS_MODEL,
+  format: "wav" | "mp3" = "wav"
 ): Promise<void> {
-  const mp3Stream = await openai.audio.speech.create({
+  const res = await openai.audio.speech.create({
     model,
     voice,
     input: text,
+    // format is supported by the SDK; fall back to mp3 if needed
+    // @ts-ignore
+    format,
   });
-  const buffer = Buffer.from(await mp3Stream.arrayBuffer());
-  fs.writeFileSync(outputPath, buffer);
+  const buf = Buffer.from(await res.arrayBuffer());
+  fs.writeFileSync(outputPath, buf);
 }
 
-// Pitch-preserving retime via ffmpeg's atempo (0.5–2.0 per stage)
+// Pitch-preserving retime via atempo (splitting outside [0.5,2] into steps)
 async function retimeAudio(
   inputPath: string,
   outputPath: string,
-  speed: number = 1
+  speed = 1
 ): Promise<void> {
-  if (!isFinite(speed) || speed <= 0) {
-    throw new Error("speechRate must be a positive number");
-  }
+  if (!isFinite(speed) || speed <= 0) throw new Error("speechRate must be > 0");
   if (Math.abs(speed - 1) < 1e-3) {
     if (inputPath !== outputPath) fs.copyFileSync(inputPath, outputPath);
     return;
   }
-
   const filters: string[] = [];
   let s = speed;
   while (s < 0.5) {
@@ -60,52 +67,29 @@ async function retimeAudio(
   await new Promise<void>((resolve, reject) => {
     ffmpeg(inputPath)
       .audioFilters(filters)
-      .outputOptions(["-ar", "24000", "-ac", "1", "-b:a", "128k", "-y"])
+      .outputOptions(["-ar", "24000", "-ac", "1", "-y"])
       .save(outputPath)
       .on("end", () => resolve())
       .on("error", reject);
   });
 }
 
-// Add this helper to prepend your provided silence mp3 to the TTS file
-async function prependSilence(
+// Generate 500ms leading silence via ffmpeg (no external files)
+async function addLeadInSilence(
   inputAudioPath: string,
   outputAudioPath: string,
-  silencePath: string = path.join(
-    __dirname,
-    "audio",
-    "500-milliseconds-of-silence.mp3"
-  )
+  ms = 500
 ): Promise<void> {
-  const concatFile = path.join(path.dirname(outputAudioPath), "concat.txt");
-  fs.writeFileSync(
-    concatFile,
-    `file '${silencePath.replace(
-      /'/g,
-      "'\\''"
-    )}'\nfile '${inputAudioPath.replace(/'/g, "'\\''")}'\n`
-  );
-
   await new Promise<void>((resolve, reject) => {
     ffmpeg()
-      .input(concatFile)
-      .inputOptions(["-f", "concat", "-safe", "0"])
-      .outputOptions([
-        "-acodec",
-        "mp3",
-        "-ar",
-        "24000",
-        "-ac",
-        "1",
-        "-b:a",
-        "128k",
-        "-y",
-      ])
+      // Mono 24kHz silence for ms duration
+      .input(`anullsrc=channel_layout=mono:sample_rate=24000`)
+      .inputOptions(["-f", "lavfi", `-t`, `${(ms / 1000).toFixed(3)}`])
+      .input(inputAudioPath)
+      .complexFilter("[0:a][1:a]concat=n=2:v=0:a=1[a]")
+      .outputOptions(["-map", "[a]", "-ar", "24000", "-ac", "1", "-y"])
       .save(outputAudioPath)
-      .on("end", () => {
-        fs.unlinkSync(concatFile);
-        resolve();
-      })
+      .on("end", () => resolve())
       .on("error", reject);
   });
 }
@@ -120,14 +104,14 @@ function getAudioDuration(audioPath: string): Promise<number> {
   });
 }
 
-// Resize images, output to outputDir, returns new paths
+// Resize images to a target canvas
 async function resizeImages(
   inputPaths: string[],
   outputDir: string,
   width: number,
   height: number
 ): Promise<string[]> {
-  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir);
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
   const tasks = inputPaths.map(async (src, idx) => {
     const dest = path.join(
       outputDir,
@@ -135,14 +119,14 @@ async function resizeImages(
     );
     await sharp(src)
       .resize(width, height, { fit: "contain", background: "#000" })
-      .toFormat("jpeg")
+      .jpeg({ quality: 90 })
       .toFile(dest);
     return dest;
   });
   return Promise.all(tasks);
 }
 
-// Create ffmpeg concat list file with durations
+// Create ffmpeg concat list file with per-image durations
 function createConcatListFile(
   images: string[],
   duration: number,
@@ -150,14 +134,17 @@ function createConcatListFile(
 ) {
   const lines: string[] = [];
   for (let i = 0; i < images.length; i++) {
-    lines.push(`file '${images[i].replace(/'/g, "'\\''")}'`);
+    const safe = images[i].replace(/'/g, "'\\''");
+    lines.push(`file '${safe}'`);
     if (i < images.length - 1) lines.push(`duration ${duration}`);
   }
-  lines.push(`file '${images[images.length - 1].replace(/'/g, "'\\''")}'`);
+  // Repeat the last image to enforce final frame display
+  const lastSafe = images[images.length - 1].replace(/'/g, "'\\''");
+  lines.push(`file '${lastSafe}'`);
   fs.writeFileSync(listPath, lines.join("\n"), "utf-8");
 }
 
-// Mix TTS and background music, trimming to ttsLength (seconds)
+// Mix narration and background; output is trimmed to narration length
 async function mixNarrationWithBackground(
   narrationPath: string,
   backgroundPath: string,
@@ -170,16 +157,19 @@ async function mixNarrationWithBackground(
       .input(narrationPath)
       .input(backgroundPath)
       .complexFilter([
-        `[1]volume=${musicVolume}[bg]`,
-        `[0][bg]amix=inputs=2:duration=first:dropout_transition=3`,
+        `[1:a]volume=${musicVolume}[bg]`,
+        `[0:a][bg]amix=inputs=2:duration=first:dropout_transition=3, dynaudnorm`,
       ])
-      .outputOptions(["-t", ttsLength.toString()])
-      .output(outputPath)
-      .on("start", (cmd: string) => console.log("Mixing bgm:", cmd))
+      .outputOptions(["-t", ttsLength.toString(), "-y"])
+      .save(outputPath)
       .on("end", () => resolve())
-      .on("error", reject)
-      .run();
+      .on("error", reject);
   });
+}
+
+// Helper: per-request temp dir
+function makeWorkDir(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "slideshow-"));
 }
 
 // --- Main function ---
@@ -192,109 +182,93 @@ export async function createSlideshowWithTTS(
   voice: VoiceType = "shimmer",
   backgroundMusicPath?: string,
   musicVolume: number = 0.15,
-  speechRate: number = 1 // e.g., 0.9 for slower, 1.1 for faster
+  speechRate: number = 1
 ): Promise<void> {
-  const tmpDir = path.join(__dirname, "tmp_slides");
-  const audioDir = path.join(__dirname, "audio");
-  if (!fs.existsSync(audioDir)) fs.mkdirSync(audioDir);
+  const work = makeWorkDir();
+  const audioDir = path.join(work, "audio");
+  const framesDir = path.join(work, "frames");
+  fs.mkdirSync(audioDir, { recursive: true });
+  fs.mkdirSync(framesDir, { recursive: true });
 
-  const ttsAudioPath = path.join(audioDir, "tts.mp3");
-  const ttsSlowedAudioPath = path.join(audioDir, "tts_slowed.mp3");
-  const ttsPaddedAudioPath = path.join(audioDir, "tts_padded.mp3");
-  const mixedAudioPath = path.join(audioDir, "tts_mixed.mp3");
-  const listFile = path.join(tmpDir, "input.txt");
+  const ttsRaw = path.join(audioDir, "tts_raw.wav"); // lossless from TTS
+  const ttsTimed = path.join(audioDir, "tts_timed.wav");
+  const ttsPadded = path.join(audioDir, "tts_padded.wav");
+  const mixedAudio = path.join(audioDir, "tts_mixed.wav");
+  const concatList = path.join(work, "list.txt");
+
+  // Optional logging for debugging ffmpeg issues:
+  const logFfmpeg = (cmd: string) => console.log("[ffmpeg]", cmd);
 
   try {
-    // 1. Generate TTS audio (newer model by default, still accepts your chosen voice)
-    await generateTTS(narrationText, ttsAudioPath, voice);
+    // 1) TTS
+    await generateTTS(narrationText, ttsRaw, voice, undefined, "wav");
 
-    // 1b. Adjust speaking rate (pitch-preserving). If speechRate === 1, it's just a copy.
-    await retimeAudio(ttsAudioPath, ttsSlowedAudioPath, speechRate);
+    // 2) Retiming
+    await retimeAudio(ttsRaw, ttsTimed, speechRate);
 
-    // 2. Prepend your silence MP3 to the (potentially retimed) TTS audio
-    await prependSilence(ttsSlowedAudioPath, ttsPaddedAudioPath);
+    // 3) Lead-in silence
+    await addLeadInSilence(ttsTimed, ttsPadded, 500);
 
-    // 3. Get duration (based on padded TTS only)
-    const audioDuration = await getAudioDuration(ttsPaddedAudioPath);
+    // 4) Duration
+    const audioDuration = await getAudioDuration(ttsPadded);
 
-    // 4. Optionally, mix background music (trimmed to TTS)
-    let finalAudioPath = ttsPaddedAudioPath;
+    // 5) Background mix (optional)
+    let finalAudioPath = ttsPadded;
     if (backgroundMusicPath) {
       await mixNarrationWithBackground(
-        ttsPaddedAudioPath,
+        ttsPadded,
         backgroundMusicPath,
-        mixedAudioPath,
+        mixedAudio,
         audioDuration,
         musicVolume
       );
-      finalAudioPath = mixedAudioPath;
+      finalAudioPath = mixedAudio;
     }
 
-    // 5. Prepare images
-    const resizedImages = await resizeImages(images, tmpDir, width, height);
-    const durationPerSlide = audioDuration / images.length;
-    createConcatListFile(resizedImages, durationPerSlide, listFile);
+    // 6) Frames
+    const resizedImages = await resizeImages(images, framesDir, width, height);
+    if (!resizedImages.length) throw new Error("No images provided");
+    const durationPerSlide = Math.max(
+      0.5,
+      audioDuration / resizedImages.length
+    ); // guard minimum
+    createConcatListFile(resizedImages, durationPerSlide, concatList);
 
-    // 6. Build video
+    // 7) Assemble video (H.264 + AAC stereo, faststart for streaming)
     await new Promise<void>((resolve, reject) => {
       ffmpeg()
-        .input(listFile)
+        .on("start", logFfmpeg)
+        .input(concatList)
         .inputOptions(["-f", "concat", "-safe", "0"])
         .input(finalAudioPath)
         .outputOptions([
           "-r",
-          "25",
+          "30",
           "-c:v",
           "libx264",
           "-pix_fmt",
           "yuv420p",
+          "-movflags",
+          "+faststart",
+          "-c:a",
+          "aac",
+          "-b:a",
+          "192k",
+          "-ac",
+          "2", // stereo for maximum compatibility
           "-shortest",
+          "-y",
         ])
-        .output(output)
-        .on("start", (cmd: string) => console.log("Assembling video:", cmd))
+        .save(output)
         .on("end", () => resolve())
-        .on("error", reject)
-        .run();
+        .on("error", reject);
     });
   } finally {
-    // Clean up temporary files!
-    if (fs.existsSync(tmpDir)) {
-      fs.readdirSync(tmpDir).forEach((f) =>
-        fs.unlinkSync(path.join(tmpDir, f))
-      );
-      fs.rmdirSync(tmpDir);
+    // Best-effort cleanup
+    try {
+      fs.rmSync(work, { recursive: true, force: true });
+    } catch (e) {
+      console.warn("Temp cleanup failed:", e);
     }
-    // Optionally clean up audio files
-    // [ttsAudioPath, ttsSlowedAudioPath, ttsPaddedAudioPath, mixedAudioPath].forEach(p => { if(fs.existsSync(p)) fs.unlinkSync(p) });
   }
-}
-
-// ========== USAGE EXAMPLE ==========
-if (require.main === module) {
-  const imagesDirectory = path.join(__dirname, "images");
-  const images = fs
-    .readdirSync(imagesDirectory)
-    .filter((f) => /\.(jpg|jpeg|png)$/i.test(f))
-    .sort()
-    .map((f) => path.join(imagesDirectory, f));
-
-  const narrationText =
-    "Meet dependable style with Auto Gals Inc.'s 2014 Toyota RAV4 XLE, finished in timeless gray and showing just 60,646 miles. Its responsive 2.5-liter 4-cylinder teams with a smooth 6-speed automatic for confident, efficient driving. Slip inside to enjoy keyless entry, power windows and locks, and a high fidelity audio system. Thoughtful packaging delivers easy maneuverability, generous cargo room, and the everyday versatility compact SUV drivers love. Safety comes standard with active belts, anti-lock brakes, and Toyota's reputation for durability. Ready to go, this RAV4 XLE blends practicality and peace of mind. See it today in Fall River or Swansea!";
-
-  const backgroundMusicPath = path.join(__dirname, "audio", "background.mp3");
-  // To disable music, use: undefined or ""
-
-  createSlideshowWithTTS(
-    images,
-    narrationText,
-    "video-file.mp4",
-    1600,
-    1200,
-    "shimmer", // Try "fable" or "alloy" for a different prosody
-    fs.existsSync(backgroundMusicPath) ? backgroundMusicPath : undefined,
-    0.2, // music volume (0.0 - 1.0)
-    0.9 // speechRate: 0.85–0.95 often feels more natural
-  )
-    .then(() => console.log("Slideshow with AI-generated narration created!"))
-    .catch((e) => console.error("Error:", e));
 }

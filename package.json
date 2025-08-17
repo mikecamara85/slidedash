@@ -1,26 +1,28 @@
 {
   "name": "slidedash",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "private": true,
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
-    "start": "node dist/createSlideshow.js"
+    "start": "node dist/server.js",
+    "dev": "ts-node --transpile-only src/server.ts"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
+    "@ffprobe-installer/ffprobe": "^2.1.2",
     "dotenv": "^17.2.0",
+    "express": "^4.19.2",
     "ffmpeg-static": "^5.2.0",
     "fluent-ffmpeg": "^2.1.3",
+    "multer": "^1.4.5-lts.1",
     "openai": "^5.9.0",
     "sharp": "^0.34.3"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/fluent-ffmpeg": "^2.1.27",
+    "@types/multer": "^1.4.12",
     "@types/node": "^22.14.1",
+    "ts-node": "^10.9.2",
     "typescript": "^5.8.3"
   }
 }
