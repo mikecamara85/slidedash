@@ -20,7 +20,9 @@ const upload = multer({
   limits: { fileSize: 30 * 1024 * 1024, files: 60 },
 });
 
-const publicDir = path.resolve(__dirname, "../public");
+const distPublic = path.resolve(__dirname, "public");
+const rootPublic = path.resolve(__dirname, "../public");
+const publicDir = fs.existsSync(distPublic) ? distPublic : rootPublic;
 console.log(
   "Serving static from:",
   publicDir,
@@ -32,6 +34,7 @@ console.log(
 app.use(
   express.static(publicDir, { index: "index.html", maxAge: "1h", etag: true })
 );
+app.get("/", (_req, res) => res.sendFile(path.join(publicDir, "index.html")));
 
 function makeWorkDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "api-run-"));
@@ -48,10 +51,6 @@ async function downloadToTemp(url: string, dir: string): Promise<string> {
 
 app.get("/health", (req: Request, res: Response) => {
   res.json({ ok: true });
-});
-
-app.get("/", (_req, res) => {
-  res.sendFile(path.join(publicDir, "index.html"));
 });
 
 app.post("/v1/slideshow", async (req: Request, res: Response) => {
