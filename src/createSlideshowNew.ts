@@ -158,9 +158,9 @@ async function mixNarrationWithBackground(
       .input(backgroundPath)
       .complexFilter([
         `[1:a]volume=${musicVolume}[bg]`,
-        `[0:a][bg]amix=inputs=2:duration=first:dropout_transition=3[a]`,
+        `[0:a][bg]amix=inputs=2:duration=first:dropout_transition=3, dynaudnorm`,
       ])
-      .outputOptions(["-map", "[a]", "-t", ttsLength.toString(), "-y"])
+      .outputOptions(["-t", ttsLength.toString(), "-y"])
       .save(outputPath)
       .on("end", () => resolve())
       .on("error", reject);
