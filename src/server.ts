@@ -20,6 +20,23 @@ const upload = multer({
   limits: { fileSize: 30 * 1024 * 1024, files: 60 },
 });
 
+// Resolve the public dir from the project root (works after TS build)
+const publicDir = path.resolve(process.cwd(), "public");
+
+// Serve static assets (index.html at "/")
+app.use(
+  express.static(publicDir, {
+    index: "index.html",
+    maxAge: "1h",
+    etag: true,
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith(".html")) {
+        res.setHeader("Cache-Control", "no-cache");
+      }
+    },
+  })
+);
+
 function makeWorkDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "api-run-"));
 }
