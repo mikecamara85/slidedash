@@ -20,21 +20,17 @@ const upload = multer({
   limits: { fileSize: 30 * 1024 * 1024, files: 60 },
 });
 
-// Resolve the public dir from the project root (works after TS build)
-const publicDir = path.resolve(process.cwd(), "public");
-
-// Serve static assets (index.html at "/")
+const publicDir = path.resolve(__dirname, "../public");
+console.log(
+  "Serving static from:",
+  publicDir,
+  "exists:",
+  fs.existsSync(publicDir),
+  "index:",
+  fs.existsSync(path.join(publicDir, "index.html"))
+);
 app.use(
-  express.static(publicDir, {
-    index: "index.html",
-    maxAge: "1h",
-    etag: true,
-    setHeaders: (res, filePath) => {
-      if (filePath.endsWith(".html")) {
-        res.setHeader("Cache-Control", "no-cache");
-      }
-    },
-  })
+  express.static(publicDir, { index: "index.html", maxAge: "1h", etag: true })
 );
 
 function makeWorkDir(): string {
@@ -52,6 +48,10 @@ async function downloadToTemp(url: string, dir: string): Promise<string> {
 
 app.get("/health", (req: Request, res: Response) => {
   res.json({ ok: true });
+});
+
+app.get("/", (_req, res) => {
+  res.sendFile(path.join(publicDir, "index.html"));
 });
 
 app.post("/v1/slideshow", async (req: Request, res: Response) => {
