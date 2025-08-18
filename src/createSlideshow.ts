@@ -6,9 +6,7 @@ import sharp from "sharp";
 import * as fs from "fs";
 import * as path from "path";
 import os from "os";
-import { pipeline } from "stream/promises";
 import { OpenAI } from "openai";
-import { randomUUID } from "crypto";
 
 // Force fluent-ffmpeg to use static binaries (portable)
 ffmpeg.setFfmpegPath(ffmpegStatic as string);
