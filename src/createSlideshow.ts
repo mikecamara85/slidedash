@@ -226,6 +226,7 @@ export async function createSlideshowWithTTS(
     }
 
     // 6) Frames
+    console.log(images);
     const orderedImages = images.slice().sort((a, b) => {
       const A = path.basename(a);
       const B = path.basename(b);
@@ -233,6 +234,8 @@ export async function createSlideshowWithTTS(
       if (A > B) return 1;
       return 0;
     });
+
+    console.log(orderedImages);
 
     const resizedImages = await resizeImages(
       orderedImages,
