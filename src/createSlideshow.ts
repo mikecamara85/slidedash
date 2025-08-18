@@ -226,7 +226,19 @@ export async function createSlideshowWithTTS(
     }
 
     // 6) Frames
-    const resizedImages = await resizeImages(images, framesDir, width, height);
+    const collator = new Intl.Collator(undefined, {
+      numeric: true,
+      sensitivity: "base",
+    });
+    const orderedImages = images
+      .slice()
+      .sort((a, b) => collator.compare(path.basename(a), path.basename(b)));
+    const resizedImages = await resizeImages(
+      orderedImages,
+      framesDir,
+      width,
+      height
+    );
     if (!resizedImages.length) throw new Error("No images provided");
     const durationPerSlide = Math.max(
       0.5,
