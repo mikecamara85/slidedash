@@ -226,13 +226,14 @@ export async function createSlideshowWithTTS(
     }
 
     // 6) Frames
-    const collator = new Intl.Collator(undefined, {
-      numeric: true,
-      sensitivity: "base",
+    const orderedImages = images.slice().sort((a, b) => {
+      const A = path.basename(a);
+      const B = path.basename(b);
+      if (A < B) return -1;
+      if (A > B) return 1;
+      return 0;
     });
-    const orderedImages = images
-      .slice()
-      .sort((a, b) => collator.compare(path.basename(a), path.basename(b)));
+
     const resizedImages = await resizeImages(
       orderedImages,
       framesDir,
