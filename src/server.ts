@@ -6,7 +6,6 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { pipeline } from "stream/promises";
-import { randomUUID } from "crypto";
 import { createSlideshowWithTTS } from "./createSlideshow";
 
 // Multer augments Express types. This helper makes access to req.files typed.
@@ -40,16 +39,84 @@ function makeWorkDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "api-run-"));
 }
 
-async function downloadToTemp(url: string, dir: string): Promise<string> {
+function safeBaseName(name: string): string {
+  // keep only basename and sanitize to prevent weird chars/paths
+  return path.basename(name).replace(/[^\w.-]/g, "_");
+}
+
+function zeroPad(n: number, width = 4): string {
+  return String(n).padStart(width, "0");
+}
+
+function extFromContentType(ct?: string): string {
+  if (!ct) return "";
+  const [type] = ct.split(";").map((s) => s.trim().toLowerCase());
+  switch (type) {
+    case "image/jpeg":
+    case "image/jpg":
+      return ".jpg";
+    case "image/png":
+      return ".png";
+    case "image/webp":
+      return ".webp";
+    case "image/gif":
+      return ".gif";
+    case "audio/mpeg":
+      return ".mp3";
+    case "audio/mp4":
+    case "audio/aac":
+      return ".m4a";
+    case "audio/wav":
+      return ".wav";
+    case "audio/ogg":
+      return ".ogg";
+    default:
+      return "";
+  }
+}
+
+async function downloadToTemp(
+  url: string,
+  dir: string,
+  index: number
+): Promise<string> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
-  const fileName = randomUUID() + path.extname(new URL(url).pathname || "");
-  const outPath = path.join(dir, fileName);
+  const u = new URL(url);
+  const urlBase = safeBaseName(path.basename(u.pathname));
+  const urlExt = path.extname(urlBase);
+  const ctExt = extFromContentType(
+    res.headers.get("content-type") || undefined
+  );
+  const ext = urlExt || ctExt || "";
+  const base = urlBase ? urlBase.replace(/\.[^.]*$/, "") : `image-${index}`;
+  const finalName = `${zeroPad(index)}-${base}${ext}`;
+  const outPath = path.join(dir, finalName);
   await pipeline(res.body as any, fs.createWriteStream(outPath));
   return outPath;
 }
 
-app.get("/health", (req: Request, res: Response) => {
+async function downloadToTempNamed(
+  url: string,
+  dir: string,
+  baseName: string
+): Promise<string> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
+  const u = new URL(url);
+  const urlBase = safeBaseName(path.basename(u.pathname));
+  const urlExt = path.extname(urlBase);
+  const ctExt = extFromContentType(
+    res.headers.get("content-type") || undefined
+  );
+  const ext = urlExt || ctExt || "";
+  const finalName = `${safeBaseName(baseName)}${ext}`;
+  const outPath = path.join(dir, finalName);
+  await pipeline(res.body as any, fs.createWriteStream(outPath));
+  return outPath;
+}
+
+app.get("/health", (_req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
@@ -79,21 +146,26 @@ app.post("/v1/slideshow", async (req: Request, res: Response) => {
   let localBgm: string | undefined;
 
   try {
-    for (const url of imageUrls) {
-      localImages.push(await downloadToTemp(url, work));
+    // Preserve URL order using index prefix in filenames
+    for (let i = 0; i < imageUrls.length; i++) {
+      localImages.push(await downloadToTemp(String(imageUrls[i]), work, i));
     }
     if (backgroundMusicUrl) {
-      localBgm = await downloadToTemp(backgroundMusicUrl, work);
+      localBgm = await downloadToTempNamed(
+        String(backgroundMusicUrl),
+        work,
+        "bgm"
+      );
     }
 
     const outPath = path.join(work, "out.mp4");
     await createSlideshowWithTTS(
-      localImages,
-      narrationText,
+      localImages, // already in order; names have index prefixes if anything sorts later
+      String(narrationText),
       outPath,
       Number(width),
       Number(height),
-      voice as any,
+      String(voice) as any,
       localBgm,
       Number(musicVolume),
       Number(speechRate)
@@ -147,26 +219,37 @@ app.post(
     let localBgm: string | undefined;
 
     try {
-      for (const f of images) {
-        const p = path.join(
-          work,
-          randomUUID() + path.extname(f.originalname || ".jpg")
-        );
+      // Write images using upload order with index prefixes + original filenames
+      images.forEach((f, i) => {
+        const rawBase =
+          f.originalname && f.originalname.trim().length > 0
+            ? f.originalname
+            : `image-${i}`;
+        const base = safeBaseName(rawBase).replace(/\.[^.]*$/, ""); // drop ext for now
+        const ext =
+          path.extname(rawBase) || extFromContentType(f.mimetype) || ""; // best-effort
+        const filename = `${zeroPad(i)}-${base}${ext}`;
+        const p = path.join(work, filename);
         fs.writeFileSync(p, f.buffer); // memoryStorage gives buffer
         localImages.push(p);
-      }
+      });
+
       if (bgmFile) {
-        const p = path.join(
-          work,
-          randomUUID() + path.extname(bgmFile.originalname || ".mp3")
-        );
+        const rawBase =
+          bgmFile.originalname && bgmFile.originalname.trim().length > 0
+            ? bgmFile.originalname
+            : "bgm";
+        const base = safeBaseName(rawBase).replace(/\.[^.]*$/, "");
+        const ext =
+          path.extname(rawBase) || extFromContentType(bgmFile.mimetype) || "";
+        const p = path.join(work, `${base}${ext || ".mp3"}`);
         fs.writeFileSync(p, bgmFile.buffer);
         localBgm = p;
       }
 
       const outPath = path.join(work, "out.mp4");
       await createSlideshowWithTTS(
-        localImages,
+        localImages, // already in correct order
         narrationText,
         outPath,
         width,
