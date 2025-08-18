@@ -6,9 +6,7 @@ import sharp from "sharp";
 import * as fs from "fs";
 import * as path from "path";
 import os from "os";
-import { pipeline } from "stream/promises";
 import { OpenAI } from "openai";
-import { randomUUID } from "crypto";
 
 // Force fluent-ffmpeg to use static binaries (portable)
 ffmpeg.setFfmpegPath(ffmpegStatic as string);
@@ -158,9 +156,9 @@ async function mixNarrationWithBackground(
       .input(backgroundPath)
       .complexFilter([
         `[1:a]volume=${musicVolume}[bg]`,
-        `[0:a][bg]amix=inputs=2:duration=first:dropout_transition=3, dynaudnorm`,
+        `[0:a][bg]amix=inputs=2:duration=first:dropout_transition=3[a]`,
       ])
-      .outputOptions(["-t", ttsLength.toString(), "-y"])
+      .outputOptions(["-map", "[a]", "-t", ttsLength.toString(), "-y"])
       .save(outputPath)
       .on("end", () => resolve())
       .on("error", reject);
@@ -226,7 +224,21 @@ export async function createSlideshowWithTTS(
     }
 
     // 6) Frames
-    const resizedImages = await resizeImages(images, framesDir, width, height);
+
+    const orderedImages = images.slice().sort((a, b) => {
+      const A = path.basename(a);
+      const B = path.basename(b);
+      if (A < B) return -1;
+      if (A > B) return 1;
+      return 0;
+    });
+
+    const resizedImages = await resizeImages(
+      orderedImages,
+      framesDir,
+      width,
+      height
+    );
     if (!resizedImages.length) throw new Error("No images provided");
     const durationPerSlide = Math.max(
       0.5,
