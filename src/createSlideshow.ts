@@ -358,6 +358,8 @@ export async function createSlideshowWithTTS(
       return 0;
     });
 
+    console.log(orderedImages);
+
     const resizedImages = await resizeImages(
       orderedImages,
       framesDir,
