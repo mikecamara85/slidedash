@@ -42,6 +42,68 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 const DEFAULT_TTS_MODEL =
   (process.env.TTS_MODEL as string) || "gpt-4o-mini-tts";
 
+function smartSortImages(paths: string[]): string[] {
+  const collator = new Intl.Collator(undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+
+  const items = paths.map((p, idx) => {
+    const base = path.basename(p);
+    const mPrefix = base.match(/^(\d{2,})-/);
+    const prefixIdx = mPrefix
+      ? parseInt(mPrefix[1], 10)
+      : Number.POSITIVE_INFINITY;
+    const nameNoPrefix = base.replace(/^\d{2,}-/, "");
+
+    // Pick the “best” numeric token: longest run of digits; if tie, the last one.
+    let bestNum: number | undefined;
+    let bestLen = -1;
+    let bestPos = -1;
+    for (const m of nameNoPrefix.matchAll(/\d+/g)) {
+      const s = m[0];
+      const len = s.length;
+      const pos = m.index ?? 0;
+      if (len > bestLen || (len === bestLen && pos > bestPos)) {
+        bestLen = len;
+        bestPos = pos;
+        bestNum = parseInt(s, 10);
+      }
+    }
+
+    return { p, idx, base, prefixIdx, nameNoPrefix, num: bestNum };
+  });
+
+  const withNums = items.filter((x) => typeof x.num === "number");
+  const numericMode = withNums.length > 0;
+
+  items.sort((a, b) => {
+    if (numericMode) {
+      const aHas = typeof a.num === "number";
+      const bHas = typeof b.num === "number";
+      if (aHas && bHas) {
+        if (a.num! !== b.num!) return a.num! - b.num!;
+        const c = collator.compare(a.nameNoPrefix, b.nameNoPrefix);
+        if (c !== 0) return c;
+        if (a.prefixIdx !== b.prefixIdx) return a.prefixIdx - b.prefixIdx;
+        return a.idx - b.idx; // stable
+      }
+      if (aHas) return -1; // numeric first
+      if (bHas) return 1; // non-numeric last
+      if (a.prefixIdx !== b.prefixIdx) return a.prefixIdx - b.prefixIdx;
+      return a.idx - b.idx;
+    } else {
+      // No numeric info anywhere: fall back to the prefixed order, then natural name
+      if (a.prefixIdx !== b.prefixIdx) return a.prefixIdx - b.prefixIdx;
+      const c = collator.compare(a.base, b.base);
+      if (c !== 0) return c;
+      return a.idx - b.idx;
+    }
+  });
+
+  return items.map((x) => x.p);
+}
+
 /**
  * Generate speech audio from text using OpenAI TTS.
  *
@@ -53,6 +115,7 @@ const DEFAULT_TTS_MODEL =
  * @param voice       One of the supported voices.
  * @param model       TTS model to use (defaults to DEFAULT_TTS_MODEL).
  * @param format      Output format ("wav" recommended; "mp3" supported).
+ *
  */
 async function generateTTS(
   text: string,
@@ -350,14 +413,7 @@ export async function createSlideshowWithTTS(
 
     // 6) Prepare frames (image ordering + resizing)
     // Sort by basename to keep a predictable sequence if input order isn't guaranteed.
-    const orderedImages = images.slice().sort((a, b) => {
-      const A = path.basename(a);
-      const B = path.basename(b);
-      if (A < B) return -1;
-      if (A > B) return 1;
-      return 0;
-    });
-
+    const orderedImages = smartSortImages(images);
     console.log(orderedImages);
 
     const resizedImages = await resizeImages(
