@@ -42,21 +42,41 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 const DEFAULT_TTS_MODEL =
   (process.env.TTS_MODEL as string) || "gpt-4o-mini-tts";
 
-function smartSortImages(paths: string[]): string[] {
-  const collator = new Intl.Collator(undefined, {
+/**
+
+Sort image paths "smartly":
+If any filenames (ignoring a leading "0000-" index prefix) contain digits,
+put those numeric-named files first, ordered by that number.
+Files without digits go last (e.g., "zz.jpg", "zzz.jpg").
+Ties are broken by natural string compare, then by the original index prefix ("0000-"),
+and finally by the original array index to keep the sort stable.
+If no files have digits at all, fall back to the index prefix order (or natural name). */
+function smartSortImages(paths: string[], clientLocale?: string): string[] {
+  // Natural/locale-aware comparator that understands numeric fragments ("10" > "2").
+
+  const collator = new Intl.Collator(clientLocale || "en", {
     numeric: true,
     sensitivity: "base",
   });
 
+  // Preprocess each path into sortable fields
   const items = paths.map((p, idx) => {
     const base = path.basename(p);
+
+    // Detect and parse a leading zero-padded index prefix we add upstream, e.g. "0003-"
+    // If no prefix, use +Infinity so non-prefixed names sort after prefixed ones in that mode.
     const mPrefix = base.match(/^(\d{2,})-/);
     const prefixIdx = mPrefix
       ? parseInt(mPrefix[1], 10)
       : Number.POSITIVE_INFINITY;
+
+    // Remove the index prefix for "real" filename comparisons
     const nameNoPrefix = base.replace(/^\d{2,}-/, "");
 
-    // Pick the “best” numeric token: longest run of digits; if tie, the last one.
+    // Extract the "best" numeric token from the filename (no prefix):
+    // - choose the longest run of digits
+    // - if there are ties, choose the last occurrence
+    // This works for patterns like IMG_1015.jpg, DSC01234.png, PXL_20240102_123456.jpg, etc.
     let bestNum: number | undefined;
     let bestLen = -1;
     let bestPos = -1;
@@ -71,29 +91,42 @@ function smartSortImages(paths: string[]): string[] {
       }
     }
 
+    // idx keeps original input order as a last-resort stable tiebreaker
     return { p, idx, base, prefixIdx, nameNoPrefix, num: bestNum };
   });
 
+  // If any file has a numeric token, we enable "numeric mode"
   const withNums = items.filter((x) => typeof x.num === "number");
   const numericMode = withNums.length > 0;
 
   items.sort((a, b) => {
     if (numericMode) {
+      // Numeric files first; non-numeric files (e.g., zz.jpg) go to the end
       const aHas = typeof a.num === "number";
       const bHas = typeof b.num === "number";
+
       if (aHas && bHas) {
+        // Both numeric: sort by the extracted number
         if (a.num! !== b.num!) return a.num! - b.num!;
+        // Tie: natural compare of names without the prefix
         const c = collator.compare(a.nameNoPrefix, b.nameNoPrefix);
         if (c !== 0) return c;
+        // Next tie-breaker: the index prefix ("0000-", "0001-", …)
         if (a.prefixIdx !== b.prefixIdx) return a.prefixIdx - b.prefixIdx;
-        return a.idx - b.idx; // stable
+        // Final tie-breaker: original input order (stable)
+        return a.idx - b.idx;
       }
-      if (aHas) return -1; // numeric first
-      if (bHas) return 1; // non-numeric last
+
+      // Only one has number → numeric first
+      if (aHas) return -1;
+      if (bHas) return 1;
+
+      // Neither has number: fall back to prefix index, then original order
       if (a.prefixIdx !== b.prefixIdx) return a.prefixIdx - b.prefixIdx;
       return a.idx - b.idx;
     } else {
-      // No numeric info anywhere: fall back to the prefixed order, then natural name
+      // No numeric info anywhere: preserve the prefixed order if present,
+      // else natural compare on the full basename; then original order
       if (a.prefixIdx !== b.prefixIdx) return a.prefixIdx - b.prefixIdx;
       const c = collator.compare(a.base, b.base);
       if (c !== 0) return c;
@@ -101,6 +134,7 @@ function smartSortImages(paths: string[]): string[] {
     }
   });
 
+  // Return the paths in the new order
   return items.map((x) => x.p);
 }
 
@@ -364,7 +398,8 @@ export async function createSlideshowWithTTS(
   voice: VoiceType = "shimmer",
   backgroundMusicPath?: string,
   musicVolume: number = 0.15,
-  speechRate: number = 1
+  speechRate: number = 1,
+  clientLocale: string = "en"
 ): Promise<void> {
   // Create isolated working directories for audio and frames.
   const work = makeWorkDir();
@@ -413,7 +448,7 @@ export async function createSlideshowWithTTS(
 
     // 6) Prepare frames (image ordering + resizing)
     // Sort by basename to keep a predictable sequence if input order isn't guaranteed.
-    const orderedImages = smartSortImages(images);
+    const orderedImages = smartSortImages(images, clientLocale);
     console.log(orderedImages);
 
     const resizedImages = await resizeImages(

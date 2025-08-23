@@ -193,6 +193,74 @@ async function downloadToTempNamed(
   return outPath;
 }
 
+function sanitizeLocaleTag(tag?: string): string | undefined {
+  if (!tag) return undefined;
+  try {
+    const [canon] = Intl.getCanonicalLocales(tag);
+    return canon; // returns undefined if empty
+  } catch {
+    return undefined; // invalid tag
+  }
+}
+
+function preferredLocaleFromHeader(header?: string): string | undefined {
+  // No header? No locale.
+  if (!header) return undefined;
+
+  // Split the header into language-range tokens by comma.
+  // Example header: "en-US,en;q=0.9,fr;q=0.8,*;q=0.1"
+  const parts = header.split(",");
+
+  type Candidate = { tag: string; q: number; index: number };
+  const candidates: Candidate[] = [];
+
+  for (let i = 0; i < parts.length; i++) {
+    const token = parts[i].trim();
+    if (!token) continue;
+
+    // Each token can have parameters after semicolons; first piece is the tag
+    // e.g., "en-US", "en", "fr", or "*" (wildcard)
+    const pieces = token.split(";").map((s) => s.trim());
+    const rawTag = pieces[0];
+
+    // Ignore empty and wildcard tags
+    if (!rawTag || rawTag === "*") continue;
+
+    // Default q (quality/priority) is 1.0 unless specified
+    let q = 1;
+
+    // Find a "q=..." param if present and parse it
+    const qParam = pieces.find((p) => /^q=/i.test(p));
+    if (qParam) {
+      const value = parseFloat(qParam.slice(2));
+      if (!Number.isNaN(value)) {
+        // Clamp q to [0, 1] to be safe
+        q = Math.max(0, Math.min(1, value));
+      }
+    }
+
+    // q=0 means “not acceptable”; skip
+    if (q <= 0) continue;
+
+    candidates.push({ tag: rawTag, q, index: i });
+  }
+
+  if (candidates.length === 0) return undefined;
+
+  // Sort by descending q; tie-break by original position to keep it stable
+  candidates.sort((a, b) => b.q - a.q || a.index - b.index);
+
+  // Canonicalize the top tag so you get normalized BCP-47 (e.g., "pt-BR")
+  const top = candidates[0].tag;
+  try {
+    const [canonical] = Intl.getCanonicalLocales(top);
+    return canonical;
+  } catch {
+    // If Intl rejects it, just return the raw tag
+    return top;
+  }
+}
+
 // Simple liveness/readiness endpoint
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ ok: true });
@@ -260,6 +328,15 @@ app.post("/v1/slideshow", async (req: Request, res: Response) => {
       );
     }
 
+    const explicitLocale = sanitizeLocaleTag(
+      (req.body?.locale as string | undefined) ||
+        (req.query?.locale as string | undefined)
+    );
+    const headerLocale = sanitizeLocaleTag(
+      preferredLocaleFromHeader(req.get("accept-language") || undefined)
+    );
+    const locale = explicitLocale || headerLocale || "en";
+
     // Final video output path within the temp dir.
     const outPath = path.join(work, "out.mp4");
 
@@ -273,7 +350,8 @@ app.post("/v1/slideshow", async (req: Request, res: Response) => {
       String(voice) as any,
       localBgm,
       Number(musicVolume),
-      Number(speechRate)
+      Number(speechRate),
+      locale
     );
 
     // Prepare streaming response headers for MP4.
@@ -388,6 +466,15 @@ app.post(
         localBgm = p;
       }
 
+      const explicitLocale = sanitizeLocaleTag(
+        (req.body?.locale as string | undefined) ||
+          (req.query?.locale as string | undefined)
+      );
+      const headerLocale = sanitizeLocaleTag(
+        preferredLocaleFromHeader(req.get("accept-language") || undefined)
+      );
+      const locale = explicitLocale || headerLocale || "en";
+
       // Output path for the final video within the temp dir.
       const outPath = path.join(work, "out.mp4");
 
@@ -401,7 +488,8 @@ app.post(
         voice,
         localBgm,
         musicVolume,
-        speechRate
+        speechRate,
+        locale
       );
 
       // Stream the resulting MP4 to the client.
