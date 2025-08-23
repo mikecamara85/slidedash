@@ -25,6 +25,7 @@ import path from "path";
 import os from "os";
 import { pipeline } from "stream/promises"; // promisified stream pipeline
 import { createSlideshowWithTTS } from "./createSlideshow"; // core slideshow builder
+import { openai } from "./openaiClient";
 
 // Multer augments Express types. This helper makes access to req.files typed.
 type MulterFiles = { [field: string]: Express.Multer.File[] };
@@ -47,6 +48,32 @@ const upload = multer({
 const distPublic = path.resolve(__dirname, "public");
 const rootPublic = path.resolve(__dirname, "../public");
 const publicDir = fs.existsSync(distPublic) ? distPublic : rootPublic;
+
+type ModerationOutcome = {
+  ok: boolean;
+  categories: string[];
+  raw?: any;
+};
+
+async function checkModeration(text: string): Promise<ModerationOutcome> {
+  // You can also use "text-moderation-latest"; "omni-moderation-latest" is fine too.
+  const model = process.env.OPENAI_MODERATION_MODEL || "omni-moderation-latest";
+
+  const resp = await openai.moderations.create({
+    model,
+    input: text,
+  });
+
+  const r = (resp as any)?.results?.[0];
+  const flagged = Boolean(r?.flagged);
+  const categories = r?.categories
+    ? Object.entries(r.categories)
+        .filter(([, v]) => v)
+        .map(([k]) => String(k))
+    : [];
+
+  return { ok: !flagged, categories, raw: r };
+}
 
 // Log some diagnostics on startup regarding static assets.
 console.log(
@@ -302,6 +329,21 @@ app.post("/v1/slideshow", async (req: Request, res: Response) => {
       .status(400)
       .json({ error: "narrationText and imageUrls[] are required" });
   }
+
+  // Moderation check
+  try {
+    const mod = await checkModeration(String(narrationText));
+    if (!mod.ok) {
+      return res.status(400).json({
+        error: "Narration text rejected by content moderation",
+        categories: mod.categories,
+      });
+    }
+  } catch (err) {
+    console.error("Moderation error:", err);
+    return res.status(503).json({ error: "Moderation service unavailable" });
+  }
+
   // Guardrails on input size.
   if (imageUrls.length > 200) {
     return res.status(400).json({ error: "Too many images" });
@@ -416,6 +458,20 @@ app.post(
       return res
         .status(400)
         .json({ error: "narrationText and images[] are required" });
+    }
+
+    // Moderation check
+    try {
+      const mod = await checkModeration(String(narrationText));
+      if (!mod.ok) {
+        return res.status(400).json({
+          error: "Narration text rejected by content moderation",
+          categories: mod.categories,
+        });
+      }
+    } catch (err) {
+      console.error("Moderation error:", err);
+      return res.status(503).json({ error: "Moderation service unavailable" });
     }
 
     // Optional background music file (at most 1)

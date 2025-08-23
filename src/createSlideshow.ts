@@ -24,7 +24,7 @@ import sharp from "sharp";
 import * as fs from "fs";
 import * as path from "path";
 import os from "os";
-import { OpenAI } from "openai";
+import { openai } from "./openaiClient";
 
 // Force fluent-ffmpeg to use static binaries for portability/reproducibility.
 // This avoids depending on system-installed ffmpeg/ffprobe versions.
@@ -36,7 +36,6 @@ type VoiceType = "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer";
 // ========== OpenAI TTS ==========
 // Initialize a single OpenAI client for reuse. Reads key from env.
 // Make sure OPENAI_API_KEY is set in your environment.
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
 // Default TTS model, overridable via env. gpt-4o-mini-tts is fast and natural.
 const DEFAULT_TTS_MODEL =
