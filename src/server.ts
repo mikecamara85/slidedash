@@ -1,22 +1,3 @@
-// src/server.ts
-/**
- * Express API that:
- * - Serves a static single-page app from ./public (from dist or src).
- * - Exposes two endpoints to create a narrated slideshow video:
- *   1) POST /v1/slideshow        -> JSON body with image URLs + options.
- *   2) POST /v1/slideshow/upload -> multipart/form-data with uploaded images + optional BGM.
- *
- * Internally:
- * - Downloads or accepts images and optional background music.
- * - Calls createSlideshowWithTTS() to synthesize narration and assemble an MP4.
- * - Streams the generated video back to the client, cleaning up temp files on close.
- *
- * Notes:
- * - Requires Node 18+ for global fetch and stream/promises.pipeline.
- * - Multer uses in-memory storage; consider disk storage for very large uploads.
- * - This prefers clarity over advanced error handling and rate limiting.
- */
-
 import "dotenv/config";
 import express, { type Request, type Response } from "express";
 import multer from "multer";
@@ -26,9 +7,12 @@ import os from "os";
 import { pipeline } from "stream/promises";
 
 import { createSlideshowWithTTS } from "./createSlideshow";
+import { config, VOICES, type VoiceType } from "./config";
+import { createQueuedJob, ensureJobIndexes, getJobById } from "./jobRepo";
+import { buildJobResponse } from "./jobResponses";
 import { openai } from "./openaiClient";
+import { startWorkerLoop } from "./workerLoop";
 
-// Multer augments Express types. This helper makes access to req.files typed.
 type MulterFiles = { [field: string]: Express.Multer.File[] };
 
 type ModerationOutcome = {
@@ -37,27 +21,37 @@ type ModerationOutcome = {
   raw?: any;
 };
 
-// =============================================================================
-// Configuration & initialization
-// =============================================================================
+type ValidatedJobRequest = {
+  narrationText: string;
+  imageUrls: string[];
+  backgroundMusicUrl?: string;
+  width: number;
+  height: number;
+  voice: VoiceType;
+  musicVolume: number;
+  speechRate: number;
+  locale: string;
+  client?: {
+    source?: string;
+    dealerSite?: string;
+    vehicleVin?: string;
+  };
+};
 
 const app = express();
 
-// Static file serving:
-// - Prefer ./dist/public when transpiled, otherwise ./public for ts-node/dev.
 const distPublic = path.resolve(__dirname, "public");
 const rootPublic = path.resolve(__dirname, "../public");
 const publicDir = fs.existsSync(distPublic) ? distPublic : rootPublic;
 
-// Multer configuration (in-memory storage).
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 30 * 1024 * 1024, files: 60 },
+  limits: {
+    fileSize: 30 * 1024 * 1024,
+    files: config.limits.imageMaxCount + 1,
+  },
 });
 
-const API_KEY = process.env.SLIDEDASH_API_KEY;
-
-// Log some diagnostics on startup regarding static assets.
 console.log(
   "Serving static from:",
   publicDir,
@@ -68,41 +62,25 @@ console.log(
 );
 
 // =============================================================================
-// Utility functions
+// Utility helpers
 // =============================================================================
 
-/**
- * Create a unique temporary working directory for each API call.
- * Avoids file name collisions across concurrent requests.
- */
 function makeWorkDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "api-run-"));
 }
 
-/**
- * Sanitize a filename by:
- * - Stripping directory components (basename only)
- * - Replacing non-word, non-dot, non-dash characters with underscores
- */
 function safeBaseName(name: string): string {
   return path.basename(name).replace(/[^\w.-]/g, "_");
 }
 
-/**
- * Left-pad a number with zeros to a fixed width. Useful for ordering.
- * Example: zeroPad(5, 4) -> "0005"
- */
 function zeroPad(n: number, width = 4): string {
   return String(n).padStart(width, "0");
 }
 
-/**
- * Guess a file extension from a Content-Type header (best-effort).
- * Returns empty string if unknown.
- */
 function extFromContentType(ct?: string): string {
   if (!ct) return "";
   const [type] = ct.split(";").map((s) => s.trim().toLowerCase());
+
   switch (type) {
     case "image/jpeg":
     case "image/jpg":
@@ -127,10 +105,6 @@ function extFromContentType(ct?: string): string {
   }
 }
 
-/**
- * Download a remote URL to the temporary directory with an index-prefixed name.
- * This preserves input order and mitigates path traversal attacks.
- */
 async function downloadToTemp(
   url: string,
   dir: string,
@@ -142,7 +116,6 @@ async function downloadToTemp(
   const u = new URL(url);
   const urlBase = safeBaseName(path.basename(u.pathname));
   const urlExt = path.extname(urlBase);
-
   const ctExt = extFromContentType(
     res.headers.get("content-type") || undefined,
   );
@@ -156,10 +129,6 @@ async function downloadToTemp(
   return outPath;
 }
 
-/**
- * Download a remote URL but force a known base name, preserving or inferring extension.
- * Good for background music (bgm) where the logical name is known in advance.
- */
 async function downloadToTempNamed(
   url: string,
   dir: string,
@@ -183,9 +152,6 @@ async function downloadToTempNamed(
   return outPath;
 }
 
-/**
- * Ensure a BCP-47 locale tag is valid; return undefined if invalid.
- */
 function sanitizeLocaleTag(tag?: string): string | undefined {
   if (!tag) return undefined;
   try {
@@ -196,9 +162,6 @@ function sanitizeLocaleTag(tag?: string): string | undefined {
   }
 }
 
-/**
- * Parse an Accept-Language header and return the preferred locale tag, if any.
- */
 function preferredLocaleFromHeader(header?: string): string | undefined {
   if (!header) return undefined;
 
@@ -242,31 +205,80 @@ function preferredLocaleFromHeader(header?: string): string | undefined {
   }
 }
 
-/**
- * Resolve the best locale for a request:
- * - explicit `locale` in body or query
- * - else Accept-Language header
- * - else "en"
- */
-function resolveLocale(req: Request): string {
+function resolveLocale(req: Request, explicitValue?: unknown): string {
   const explicitLocale = sanitizeLocaleTag(
-    (req.body?.locale as string | undefined) ||
-      (req.query?.locale as string | undefined),
+    typeof explicitValue === "string" ? explicitValue : undefined,
   );
   const headerLocale = sanitizeLocaleTag(
     preferredLocaleFromHeader(req.get("accept-language") || undefined),
   );
-  return explicitLocale || headerLocale || "en";
+
+  return explicitLocale || headerLocale || config.defaults.locale;
 }
 
-/**
- * OpenAI moderation wrapper for narration text.
- */
-async function checkModeration(text: string): Promise<ModerationOutcome> {
-  const model = process.env.OPENAI_MODERATION_MODEL || "omni-moderation-latest";
+function isVoice(value: unknown): value is VoiceType {
+  return (
+    typeof value === "string" && (VOICES as readonly string[]).includes(value)
+  );
+}
 
+function parseHttpUrl(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return undefined;
+    }
+    return parsed.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function sanitizeOptionalShortString(
+  value: unknown,
+  maxLength = 120,
+): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, maxLength);
+}
+
+function parseBoundedNumber(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number | undefined {
+  const num =
+    value === undefined || value === null || value === ""
+      ? fallback
+      : Number(value);
+
+  if (!Number.isFinite(num)) return undefined;
+  if (num < min || num > max) return undefined;
+  return num;
+}
+
+function parseBoundedInteger(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number | undefined {
+  const num = parseBoundedNumber(value, fallback, min, max);
+  if (num === undefined) return undefined;
+  if (!Number.isInteger(num)) return undefined;
+  return num;
+}
+
+async function checkModeration(text: string): Promise<ModerationOutcome> {
   const resp = await openai.moderations.create({
-    model,
+    model: config.openai.moderationModel,
     input: text,
   });
 
@@ -282,13 +294,209 @@ async function checkModeration(text: string): Promise<ModerationOutcome> {
 }
 
 // =============================================================================
+// Async API validation / error helpers
+// =============================================================================
+
+function sendApiError(
+  res: Response,
+  status: number,
+  code: string,
+  message: string,
+  extra?: Record<string, unknown>,
+) {
+  return res.status(status).json({
+    error: {
+      code,
+      message,
+      ...(extra ?? {}),
+    },
+  });
+}
+
+function validateCreateJobRequest(
+  req: Request,
+): { ok: true; value: ValidatedJobRequest } | { ok: false; message: string } {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+
+  const narrationText =
+    typeof body.narrationText === "string" ? body.narrationText.trim() : "";
+
+  if (!narrationText) {
+    return {
+      ok: false,
+      message: "narrationText is required",
+    };
+  }
+
+  if (narrationText.length > config.limits.narrationMaxChars) {
+    return {
+      ok: false,
+      message: `narrationText must be <= ${config.limits.narrationMaxChars} characters`,
+    };
+  }
+
+  if (!Array.isArray(body.imageUrls) || body.imageUrls.length === 0) {
+    return {
+      ok: false,
+      message: "imageUrls must be a non-empty array",
+    };
+  }
+
+  if (body.imageUrls.length > config.limits.imageMaxCount) {
+    return {
+      ok: false,
+      message: `imageUrls must contain at most ${config.limits.imageMaxCount} items`,
+    };
+  }
+
+  const imageUrls: string[] = [];
+  for (let i = 0; i < body.imageUrls.length; i++) {
+    const parsed = parseHttpUrl(body.imageUrls[i]);
+    if (!parsed) {
+      return {
+        ok: false,
+        message: `imageUrls[${i}] must be a valid http/https URL`,
+      };
+    }
+    imageUrls.push(parsed);
+  }
+
+  const backgroundMusicUrl =
+    body.backgroundMusicUrl === undefined || body.backgroundMusicUrl === null
+      ? undefined
+      : parseHttpUrl(body.backgroundMusicUrl);
+
+  if (
+    body.backgroundMusicUrl !== undefined &&
+    body.backgroundMusicUrl !== null &&
+    !backgroundMusicUrl
+  ) {
+    return {
+      ok: false,
+      message: "backgroundMusicUrl must be a valid http/https URL",
+    };
+  }
+
+  const width = parseBoundedInteger(
+    body.width,
+    config.defaults.width,
+    config.limits.widthMin,
+    config.limits.widthMax,
+  );
+  if (width === undefined) {
+    return {
+      ok: false,
+      message: `width must be an integer between ${config.limits.widthMin} and ${config.limits.widthMax}`,
+    };
+  }
+
+  const height = parseBoundedInteger(
+    body.height,
+    config.defaults.height,
+    config.limits.heightMin,
+    config.limits.heightMax,
+  );
+  if (height === undefined) {
+    return {
+      ok: false,
+      message: `height must be an integer between ${config.limits.heightMin} and ${config.limits.heightMax}`,
+    };
+  }
+
+  const voice = body.voice === undefined ? config.defaults.voice : body.voice;
+  if (!isVoice(voice)) {
+    return {
+      ok: false,
+      message: `voice must be one of: ${VOICES.join(", ")}`,
+    };
+  }
+
+  const speechRate = parseBoundedNumber(
+    body.speechRate,
+    config.defaults.speechRate,
+    config.limits.speechRateMin,
+    config.limits.speechRateMax,
+  );
+  if (speechRate === undefined) {
+    return {
+      ok: false,
+      message: `speechRate must be between ${config.limits.speechRateMin} and ${config.limits.speechRateMax}`,
+    };
+  }
+
+  const musicVolume = parseBoundedNumber(
+    body.musicVolume,
+    config.defaults.musicVolume,
+    config.limits.musicVolumeMin,
+    config.limits.musicVolumeMax,
+  );
+  if (musicVolume === undefined) {
+    return {
+      ok: false,
+      message: `musicVolume must be between ${config.limits.musicVolumeMin} and ${config.limits.musicVolumeMax}`,
+    };
+  }
+
+  if (
+    body.locale !== undefined &&
+    body.locale !== null &&
+    !sanitizeLocaleTag(String(body.locale))
+  ) {
+    return {
+      ok: false,
+      message: "locale must be a valid BCP-47 language tag",
+    };
+  }
+
+  const locale = resolveLocale(req, body.locale);
+
+  let client:
+    | {
+        source?: string;
+        dealerSite?: string;
+        vehicleVin?: string;
+      }
+    | undefined;
+
+  if (body.client !== undefined && body.client !== null) {
+    if (typeof body.client !== "object" || Array.isArray(body.client)) {
+      return {
+        ok: false,
+        message: "client must be an object when provided",
+      };
+    }
+
+    const clientInput = body.client as Record<string, unknown>;
+    client = {
+      source: sanitizeOptionalShortString(clientInput.source),
+      dealerSite: sanitizeOptionalShortString(clientInput.dealerSite),
+      vehicleVin: sanitizeOptionalShortString(clientInput.vehicleVin),
+    };
+  }
+
+  return {
+    ok: true,
+    value: {
+      narrationText,
+      imageUrls,
+      backgroundMusicUrl,
+      width,
+      height,
+      voice,
+      musicVolume,
+      speechRate,
+      locale,
+      client,
+    },
+  };
+}
+
+// =============================================================================
 // Middleware
 // =============================================================================
 
-// Parse JSON bodies with a conservative limit (tune as needed)
 app.use(express.json({ limit: "2mb" }));
 
-// Serve static assets with basic caching.
 app.use(
   express.static(publicDir, {
     index: "index.html",
@@ -297,15 +505,14 @@ app.use(
   }),
 );
 
-// Protect only the API prefix, not static assets.
 app.use("/v1", (req, res, next) => {
-  // If no key configured in env, auth is effectively disabled (useful for local dev).
-  if (!API_KEY) return next();
+  if (!config.api.key) return next();
 
   const key = req.get("x-api-key");
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
+  if (key !== config.api.key) {
+    return sendApiError(res, 401, "unauthorized", "Unauthorized");
   }
+
   next();
 });
 
@@ -313,169 +520,198 @@ app.use("/v1", (req, res, next) => {
 // Basic routes
 // =============================================================================
 
-// Root route serves the SPA index (in case the static middleware missed it)
 app.get("/", (_req, res) => {
   res.sendFile(path.join(publicDir, "index.html"));
 });
 
-// Simple liveness/readiness endpoint
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
 // =============================================================================
-// /v1/slideshow (JSON; URLs)
+// New async job API
 // =============================================================================
 
-/**
- * JSON API: Create a slideshow from remote image URLs.
- *
- * Body (application/json):
- * {
- *   "narrationText": "string",           // required
- *   "imageUrls": ["https://..."],        // required, non-empty
- *   "backgroundMusicUrl": "https://...", // optional
- *   "width": 1600,                       // optional
- *   "height": 1200,                      // optional
- *   "voice": "shimmer",                  // optional
- *   "musicVolume": 0.2,                  // optional (0..1)
- *   "speechRate": 1.0                    // optional (>0)
- * }
- *
- * Response: Streams video/mp4.
- */
-app.post("/v1/slideshow", async (req: Request, res: Response) => {
-  const {
-    narrationText,
-    imageUrls,
-    backgroundMusicUrl,
-    width = 1600,
-    height = 1200,
-    voice = "shimmer",
-    musicVolume = 0.2,
-    speechRate = 1.0,
-  } = (req.body ?? {}) as any;
-
-  if (!narrationText || !Array.isArray(imageUrls) || imageUrls.length === 0) {
-    return res
-      .status(400)
-      .json({ error: "narrationText and imageUrls[] are required" });
+app.post("/v1/jobs/slideshow", async (req: Request, res: Response) => {
+  const validated = validateCreateJobRequest(req);
+  if (!validated.ok) {
+    return sendApiError(res, 400, "invalid_request", validated.message);
   }
 
-  // Moderation check
   try {
-    const mod = await checkModeration(String(narrationText));
+    const mod = await checkModeration(validated.value.narrationText);
+
     if (!mod.ok) {
-      return res.status(400).json({
-        error: "Narration text rejected by content moderation",
-        categories: mod.categories,
-      });
-    }
-  } catch (err) {
-    console.error("Moderation error:", err);
-    return res.status(503).json({ error: "Moderation service unavailable" });
-  }
-
-  if (imageUrls.length > 200) {
-    return res.status(400).json({ error: "Too many images" });
-  }
-
-  const work = makeWorkDir();
-  const localImages: string[] = [];
-  let localBgm: string | undefined;
-
-  try {
-    for (let i = 0; i < imageUrls.length; i++) {
-      localImages.push(await downloadToTemp(String(imageUrls[i]), work, i));
-    }
-
-    if (backgroundMusicUrl) {
-      localBgm = await downloadToTempNamed(
-        String(backgroundMusicUrl),
-        work,
-        "bgm",
+      return sendApiError(
+        res,
+        400,
+        "moderation_rejected",
+        "Narration text rejected by content moderation",
+        { categories: mod.categories },
       );
     }
-
-    const locale = resolveLocale(req);
-    const outPath = path.join(work, "out.mp4");
-
-    await createSlideshowWithTTS(
-      localImages,
-      String(narrationText),
-      outPath,
-      Number(width),
-      Number(height),
-      String(voice) as any,
-      localBgm,
-      Number(musicVolume),
-      Number(speechRate),
-      locale,
+  } catch (error) {
+    console.error("Moderation error:", error);
+    return sendApiError(
+      res,
+      503,
+      "moderation_unavailable",
+      "Moderation service unavailable",
     );
+  }
 
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", 'inline; filename="slideshow.mp4"');
+  try {
+    const job = await createQueuedJob(validated.value);
 
-    const stat = fs.statSync(outPath);
-    res.setHeader("Content-Length", stat.size.toString());
+    return res.status(201).json({
+      jobId: job._id,
+      status: job.status,
+      createdAt: job.createdAt.toISOString(),
+    });
+  } catch (error) {
+    console.error("Create job error:", error);
+    return sendApiError(
+      res,
+      500,
+      "internal_error",
+      "Failed to create slideshow job",
+    );
+  }
+});
 
-    fs.createReadStream(outPath)
-      .pipe(res)
-      .on("close", () => {
-        try {
-          fs.rmSync(work, { recursive: true, force: true });
-        } catch {}
-      });
-  } catch (e: any) {
-    try {
-      fs.rmSync(work, { recursive: true, force: true });
-    } catch {}
-    console.error(e);
-    res.status(500).json({ error: e?.message || "Failed to create video" });
+app.get("/v1/jobs/:jobId", async (req: Request, res: Response) => {
+  try {
+    const jobId = String(req.params.jobId || "").trim();
+    if (!jobId) {
+      return sendApiError(res, 400, "invalid_request", "jobId is required");
+    }
+
+    const job = await getJobById(jobId);
+    if (!job) {
+      return sendApiError(res, 404, "job_not_found", "Job not found");
+    }
+
+    const response = await buildJobResponse(job);
+    return res.json(response);
+  } catch (error) {
+    console.error("Get job error:", error);
+    return sendApiError(
+      res,
+      500,
+      "internal_error",
+      "Failed to fetch slideshow job",
+    );
   }
 });
 
 // =============================================================================
-// /v1/slideshow/upload (multipart; file uploads)
+// Legacy synchronous routes
 // =============================================================================
 
-/**
- * Multipart upload API: Create a slideshow from uploaded image files.
- *
- * Form fields (multipart/form-data):
- *  - images[]: up to 200 image files (required)
- *  - bgm: optional audio file
- *  - narrationText: string (required)
- *  - width, height, voice, musicVolume, speechRate: optional settings
- *
- * Response: Streams video/mp4.
- */
-app.post(
-  "/v1/slideshow/upload",
-  upload.fields([
-    { name: "images", maxCount: 200 },
-    { name: "bgm", maxCount: 1 },
-  ]),
-  async (req: Request, res: Response) => {
-    const narrationText = String((req.body?.narrationText ?? "").toString());
-    const width = Number(req.body?.width ?? 1600);
-    const height = Number(req.body?.height ?? 1200);
-    const voice = (req.body?.voice ?? "shimmer") as any;
-    const musicVolume = Number(req.body?.musicVolume ?? 0.2);
-    const speechRate = Number(req.body?.speechRate ?? 1.0);
+if (config.legacy.syncRoutesEnabled) {
+  app.post("/v1/slideshow", async (req: Request, res: Response) => {
+    const {
+      narrationText,
+      imageUrls,
+      backgroundMusicUrl,
+      width = config.defaults.width,
+      height = config.defaults.height,
+      voice = config.defaults.voice,
+      musicVolume = config.defaults.musicVolume,
+      speechRate = config.defaults.speechRate,
+      locale,
+    } = (req.body ?? {}) as any;
 
-    const files = (req as Request & { files?: MulterFiles }).files || {};
-    const images = (files["images"] as Express.Multer.File[]) || [];
+    const trimmedNarration =
+      typeof narrationText === "string" ? narrationText.trim() : "";
 
-    if (!narrationText || images.length === 0) {
+    if (
+      !trimmedNarration ||
+      !Array.isArray(imageUrls) ||
+      imageUrls.length === 0
+    ) {
       return res
         .status(400)
-        .json({ error: "narrationText and images[] are required" });
+        .json({ error: "narrationText and imageUrls[] are required" });
     }
 
-    // Moderation check
+    if (trimmedNarration.length > config.limits.narrationMaxChars) {
+      return res.status(400).json({
+        error: `narrationText must be <= ${config.limits.narrationMaxChars} characters`,
+      });
+    }
+
+    if (imageUrls.length > config.limits.imageMaxCount) {
+      return res
+        .status(400)
+        .json({
+          error: `Too many images (max ${config.limits.imageMaxCount})`,
+        });
+    }
+
+    if (!isVoice(voice)) {
+      return res
+        .status(400)
+        .json({ error: `voice must be one of: ${VOICES.join(", ")}` });
+    }
+
+    const widthNum = parseBoundedInteger(
+      width,
+      config.defaults.width,
+      config.limits.widthMin,
+      config.limits.widthMax,
+    );
+    const heightNum = parseBoundedInteger(
+      height,
+      config.defaults.height,
+      config.limits.heightMin,
+      config.limits.heightMax,
+    );
+    const speechRateNum = parseBoundedNumber(
+      speechRate,
+      config.defaults.speechRate,
+      config.limits.speechRateMin,
+      config.limits.speechRateMax,
+    );
+    const musicVolumeNum = parseBoundedNumber(
+      musicVolume,
+      config.defaults.musicVolume,
+      config.limits.musicVolumeMin,
+      config.limits.musicVolumeMax,
+    );
+
+    if (
+      widthNum === undefined ||
+      heightNum === undefined ||
+      speechRateNum === undefined ||
+      musicVolumeNum === undefined
+    ) {
+      return res.status(400).json({ error: "Invalid render settings" });
+    }
+
+    const normalizedImageUrls: string[] = [];
+    for (let i = 0; i < imageUrls.length; i++) {
+      const parsed = parseHttpUrl(imageUrls[i]);
+      if (!parsed) {
+        return res
+          .status(400)
+          .json({ error: `imageUrls[${i}] must be a valid URL` });
+      }
+      normalizedImageUrls.push(parsed);
+    }
+
+    let normalizedBgm: string | undefined;
+    if (backgroundMusicUrl !== undefined && backgroundMusicUrl !== null) {
+      normalizedBgm = parseHttpUrl(backgroundMusicUrl);
+      if (!normalizedBgm) {
+        return res
+          .status(400)
+          .json({ error: "backgroundMusicUrl must be a valid URL" });
+      }
+    }
+
     try {
-      const mod = await checkModeration(String(narrationText));
+      const mod = await checkModeration(trimmedNarration);
       if (!mod.ok) {
         return res.status(400).json({
           error: "Narration text rejected by content moderation",
@@ -487,60 +723,45 @@ app.post(
       return res.status(503).json({ error: "Moderation service unavailable" });
     }
 
-    const bgmFile = files["bgm"]?.[0] as Express.Multer.File | undefined;
-
     const work = makeWorkDir();
     const localImages: string[] = [];
     let localBgm: string | undefined;
 
     try {
-      images.forEach((f, i) => {
-        const rawBase =
-          f.originalname && f.originalname.trim().length > 0
-            ? f.originalname
-            : `image-${i}`;
-
-        const base = safeBaseName(rawBase).replace(/\.[^.]*$/, "");
-        const ext =
-          path.extname(rawBase) || extFromContentType(f.mimetype) || "";
-
-        const filename = `${zeroPad(i)}-${base}${ext}`;
-        const p = path.join(work, filename);
-
-        fs.writeFileSync(p, f.buffer);
-        localImages.push(p);
-      });
-
-      if (bgmFile) {
-        const rawBase =
-          bgmFile.originalname && bgmFile.originalname.trim().length > 0
-            ? bgmFile.originalname
-            : "bgm";
-        const base = safeBaseName(rawBase).replace(/\.[^.]*$/, "");
-        const ext =
-          path.extname(rawBase) || extFromContentType(bgmFile.mimetype) || "";
-        const p = path.join(work, `${base}${ext || ".mp3"}`);
-        fs.writeFileSync(p, bgmFile.buffer);
-        localBgm = p;
+      for (let i = 0; i < normalizedImageUrls.length; i++) {
+        localImages.push(await downloadToTemp(normalizedImageUrls[i], work, i));
       }
 
-      const locale = resolveLocale(req);
+      if (normalizedBgm) {
+        localBgm = await downloadToTempNamed(normalizedBgm, work, "bgm");
+      }
+
+      const resolvedLocale =
+        locale !== undefined && locale !== null
+          ? resolveLocale(req, locale)
+          : resolveLocale(req);
+
       const outPath = path.join(work, "out.mp4");
 
       await createSlideshowWithTTS(
         localImages,
-        narrationText,
+        trimmedNarration,
         outPath,
-        width,
-        height,
+        widthNum,
+        heightNum,
         voice,
         localBgm,
-        musicVolume,
-        speechRate,
-        locale,
+        musicVolumeNum,
+        speechRateNum,
+        resolvedLocale,
       );
 
       res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Content-Disposition", 'inline; filename="slideshow.mp4"');
+
+      const stat = fs.statSync(outPath);
+      res.setHeader("Content-Length", stat.size.toString());
+
       fs.createReadStream(outPath)
         .pipe(res)
         .on("close", () => {
@@ -555,14 +776,189 @@ app.post(
       console.error(e);
       res.status(500).json({ error: e?.message || "Failed to create video" });
     }
-  },
-);
+  });
+
+  app.post(
+    "/v1/slideshow/upload",
+    upload.fields([
+      { name: "images", maxCount: config.limits.imageMaxCount },
+      { name: "bgm", maxCount: 1 },
+    ]),
+    async (req: Request, res: Response) => {
+      const narrationText = String(
+        (req.body?.narrationText ?? "").toString(),
+      ).trim();
+      const width = Number(req.body?.width ?? config.defaults.width);
+      const height = Number(req.body?.height ?? config.defaults.height);
+      const voice = req.body?.voice ?? config.defaults.voice;
+      const musicVolume = Number(
+        req.body?.musicVolume ?? config.defaults.musicVolume,
+      );
+      const speechRate = Number(
+        req.body?.speechRate ?? config.defaults.speechRate,
+      );
+      const locale = req.body?.locale;
+
+      const files = (req as Request & { files?: MulterFiles }).files || {};
+      const images = (files["images"] as Express.Multer.File[]) || [];
+
+      if (!narrationText || images.length === 0) {
+        return res
+          .status(400)
+          .json({ error: "narrationText and images[] are required" });
+      }
+
+      if (narrationText.length > config.limits.narrationMaxChars) {
+        return res.status(400).json({
+          error: `narrationText must be <= ${config.limits.narrationMaxChars} characters`,
+        });
+      }
+
+      if (!isVoice(voice)) {
+        return res
+          .status(400)
+          .json({ error: `voice must be one of: ${VOICES.join(", ")}` });
+      }
+
+      const widthNum = parseBoundedInteger(
+        width,
+        config.defaults.width,
+        config.limits.widthMin,
+        config.limits.widthMax,
+      );
+      const heightNum = parseBoundedInteger(
+        height,
+        config.defaults.height,
+        config.limits.heightMin,
+        config.limits.heightMax,
+      );
+      const speechRateNum = parseBoundedNumber(
+        speechRate,
+        config.defaults.speechRate,
+        config.limits.speechRateMin,
+        config.limits.speechRateMax,
+      );
+      const musicVolumeNum = parseBoundedNumber(
+        musicVolume,
+        config.defaults.musicVolume,
+        config.limits.musicVolumeMin,
+        config.limits.musicVolumeMax,
+      );
+
+      if (
+        widthNum === undefined ||
+        heightNum === undefined ||
+        speechRateNum === undefined ||
+        musicVolumeNum === undefined
+      ) {
+        return res.status(400).json({ error: "Invalid render settings" });
+      }
+
+      try {
+        const mod = await checkModeration(narrationText);
+        if (!mod.ok) {
+          return res.status(400).json({
+            error: "Narration text rejected by content moderation",
+            categories: mod.categories,
+          });
+        }
+      } catch (err) {
+        console.error("Moderation error:", err);
+        return res
+          .status(503)
+          .json({ error: "Moderation service unavailable" });
+      }
+
+      const bgmFile = files["bgm"]?.[0] as Express.Multer.File | undefined;
+
+      const work = makeWorkDir();
+      const localImages: string[] = [];
+      let localBgm: string | undefined;
+
+      try {
+        images.forEach((f, i) => {
+          const rawBase =
+            f.originalname && f.originalname.trim().length > 0
+              ? f.originalname
+              : `image-${i}`;
+
+          const base = safeBaseName(rawBase).replace(/\.[^.]*$/, "");
+          const ext =
+            path.extname(rawBase) || extFromContentType(f.mimetype) || "";
+
+          const filename = `${zeroPad(i)}-${base}${ext}`;
+          const p = path.join(work, filename);
+
+          fs.writeFileSync(p, f.buffer);
+          localImages.push(p);
+        });
+
+        if (bgmFile) {
+          const rawBase =
+            bgmFile.originalname && bgmFile.originalname.trim().length > 0
+              ? bgmFile.originalname
+              : "bgm";
+          const base = safeBaseName(rawBase).replace(/\.[^.]*$/, "");
+          const ext =
+            path.extname(rawBase) || extFromContentType(bgmFile.mimetype) || "";
+          const p = path.join(work, `${base}${ext || ".mp3"}`);
+          fs.writeFileSync(p, bgmFile.buffer);
+          localBgm = p;
+        }
+
+        const resolvedLocale =
+          locale !== undefined && locale !== null
+            ? resolveLocale(req, locale)
+            : resolveLocale(req);
+
+        const outPath = path.join(work, "out.mp4");
+
+        await createSlideshowWithTTS(
+          localImages,
+          narrationText,
+          outPath,
+          widthNum,
+          heightNum,
+          voice,
+          localBgm,
+          musicVolumeNum,
+          speechRateNum,
+          resolvedLocale,
+        );
+
+        res.setHeader("Content-Type", "video/mp4");
+        fs.createReadStream(outPath)
+          .pipe(res)
+          .on("close", () => {
+            try {
+              fs.rmSync(work, { recursive: true, force: true });
+            } catch {}
+          });
+      } catch (e: any) {
+        try {
+          fs.rmSync(work, { recursive: true, force: true });
+        } catch {}
+        console.error(e);
+        res.status(500).json({ error: e?.message || "Failed to create video" });
+      }
+    },
+  );
+}
 
 // =============================================================================
-// Server startup
+// Startup
 // =============================================================================
 
-const port = Number(process.env.PORT || 8080);
-app.listen(port, () => {
-  console.log(`Slideshow API listening on :${port}`);
+async function main() {
+  await ensureJobIndexes();
+  startWorkerLoop();
+
+  app.listen(config.port, () => {
+    console.log(`Slideshow API listening on :${config.port}`);
+  });
+}
+
+main().catch((error) => {
+  console.error("Failed to start server:", error);
+  process.exit(1);
 });
