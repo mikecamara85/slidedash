@@ -1,3 +1,5 @@
+// ./src/workerLoop.ts
+
 import { randomBytes } from "crypto";
 
 import { config } from "./config";

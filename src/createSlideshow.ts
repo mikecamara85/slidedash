@@ -1,3 +1,5 @@
+// ./src/createSlideshow.ts
+
 import "dotenv/config";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegStatic from "ffmpeg-static";
@@ -12,6 +14,9 @@ import { openai } from "./openaiClient";
 
 ffmpeg.setFfmpegPath(ffmpegStatic as string);
 ffmpeg.setFfprobePath(ffprobe.path);
+
+const GLOBAL_TTS_INSTRUCTIONS =
+  "Speak like an engaging, enthusiastic presenter. Use bright energy, confident pacing, and natural emphasis. Sound excited and polished, while staying professional and easy to understand. Avoid monotone delivery.";
 
 function makeWorkDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "slideshow-"));
@@ -28,9 +33,9 @@ async function generateTTS(
     model,
     voice,
     input: text,
-    // @ts-ignore
+    instructions: GLOBAL_TTS_INSTRUCTIONS,
     format,
-  });
+  } as any);
 
   const buf = Buffer.from(await res.arrayBuffer());
   fs.writeFileSync(outputPath, buf);

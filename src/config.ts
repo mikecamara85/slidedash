@@ -1,3 +1,5 @@
+// ./src/config.ts
+
 import "dotenv/config";
 
 export const VOICES = [

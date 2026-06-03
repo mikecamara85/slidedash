@@ -1,3 +1,5 @@
+// ./src/server.ts
+
 import "dotenv/config";
 import express, { type Request, type Response } from "express";
 import multer from "multer";
@@ -642,11 +644,9 @@ if (config.legacy.syncRoutesEnabled) {
     }
 
     if (imageUrls.length > config.limits.imageMaxCount) {
-      return res
-        .status(400)
-        .json({
-          error: `Too many images (max ${config.limits.imageMaxCount})`,
-        });
+      return res.status(400).json({
+        error: `Too many images (max ${config.limits.imageMaxCount})`,
+      });
     }
 
     if (!isVoice(voice)) {
